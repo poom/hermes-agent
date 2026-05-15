@@ -293,38 +293,147 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     }
   }
 
-  // Build a single full-line string for a row (all cells concatenated with padding + gaps).
+  // Grapheme-safe hard-break: prefer Intl.Segmenter, fall back to code-point split
+  const segmenter = typeof Intl !== 'undefined' && 'Segmenter' in Intl
+    ? new (Intl as any).Segmenter(undefined, { granularity: 'grapheme' })
+    : null
+
+  const graphemes = (s: string): string[] =>
+    segmenter
+      ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment)
+      : [...s]
+
+  // Word-wrap plain text to fit within `width` display columns.
+  // Operates on stripped text for correct width measurement.
+  const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
+    const text = stripInlineMarkup(raw)
+    if (width <= 0) return [text]
+    if (stringWidth(text) <= width) return [text]
+
+    const words = text.split(/\s+/).filter(w => w.length > 0)
+    const lines: string[] = []
+    let current = ''
+    let currentWidth = 0
+
+    for (const word of words) {
+      const w = stringWidth(word)
+      if (currentWidth === 0) {
+        if (hard && w > width) {
+          for (const ch of graphemes(word)) {
+            const cw = stringWidth(ch)
+            if (currentWidth + cw > width && current) {
+              lines.push(current)
+              current = ''
+              currentWidth = 0
+            }
+            current += ch
+            currentWidth += cw
+          }
+        } else {
+          current = word
+          currentWidth = w
+        }
+      } else if (currentWidth + 1 + w <= width) {
+        current += ' ' + word
+        currentWidth += 1 + w
+      } else {
+        lines.push(current)
+        current = word
+        currentWidth = w
+      }
+    }
+    if (current) lines.push(current)
+    return lines.length > 0 ? lines : ['']
+  }
+
+  const isHard = totalMin > availableWidth // tier 3 needs hard word breaks
+  const sep = columnWidths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
+
+  // When wrapping isn't needed, build single-line strings per row.
   // All cells render as plain text via stripInlineMarkup.
   // TODO: follow-up — format to ANSI then wrap with wrapAnsi for inline markdown preservation.
   // See free-code/src/components/MarkdownTable.tsx L44-L62 for approach.
-  const buildRowString = (row: string[]): string =>
-    row.map((cell, ci) => {
-      const text = stripInlineMarkup(cell)
-      const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
-      const gap = ci < numCols - 1 ? '  ' : ''
-      return text + pad + gap
-    }).join('')
+  if (!needsWrap) {
+    const buildRowString = (row: string[]): string =>
+      row.map((cell, ci) => {
+        const text = stripInlineMarkup(cell)
+        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
+        const gap = ci < numCols - 1 ? '  ' : ''
+        return text + pad + gap
+      }).join('')
 
-  const sep = columnWidths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
+    return (
+      <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
+        {normalizedRows.map((row, ri) => (
+          <Fragment key={ri}>
+            <Text
+              bold={ri === 0}
+              color={ri === 0 ? t.color.accent : undefined}
+              wrap="truncate-end"
+            >
+              {buildRowString(row)}
+            </Text>
+            {ri === 0 && normalizedRows.length > 1 ? (
+              <Text color={t.color.muted} dimColor wrap="truncate-end">{sep}</Text>
+            ) : null}
+          </Fragment>
+        ))}
+      </Box>
+    )
+  }
 
-  // Render: one <Text> per visual line, wrap="truncate-end" prevents Ink reflow.
-  // This follows free-code's model (MarkdownTable.tsx L320) of building complete
-  // row strings and rendering as a single block.
+  // Wrapping path: build multi-line rows as complete strings.
+  type LineEntry = { text: string; kind: 'header' | 'separator' | 'body' }
+
+  const buildRowLines = (row: string[]): string[] => {
+    const cellLines = row.map((cell, ci) =>
+      wrapCell(cell, columnWidths[ci]!, isHard)
+    )
+    const maxLines = Math.max(...cellLines.map(l => l.length), 1)
+
+    const result: string[] = []
+    for (let li = 0; li < maxLines; li++) {
+      let line = ''
+      for (let ci = 0; ci < numCols; ci++) {
+        const cl = cellLines[ci] ?? ['']
+        const cellText = li < cl.length ? cl[li]! : ''
+        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(cellText)))
+        line += cellText + pad
+        if (ci < numCols - 1) line += '  '
+      }
+      result.push(line)
+    }
+    return result
+  }
+
+  // Build all lines with metadata for styling
+  const allEntries: LineEntry[] = []
+  normalizedRows.forEach((row, ri) => {
+    const kind = ri === 0 ? 'header' as const : 'body' as const
+    buildRowLines(row).forEach(text => allEntries.push({ text, kind }))
+    if (ri === 0 && normalizedRows.length > 1) {
+      allEntries.push({ text: sep, kind: 'separator' })
+    }
+  })
+
+  // Post-render safety condition: compute max line width.
+  // If any line exceeds available space, vertical fallback should catch it (Task 4).
+  const maxLineWidth = Math.max(...allEntries.map(e => stringWidth(e.text)))
+  const safetyOverflow = cols != null && maxLineWidth > cols - TABLE_PADDING_LEFT - SAFETY_MARGIN
+
+  // Render wrapped rows — one <Text> per visual line.
   return (
     <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
-      {normalizedRows.map((row, ri) => (
-        <Fragment key={ri}>
-          <Text
-            bold={ri === 0}
-            color={ri === 0 ? t.color.accent : undefined}
-            wrap="truncate-end"
-          >
-            {buildRowString(row)}
-          </Text>
-          {ri === 0 && normalizedRows.length > 1 ? (
-            <Text color={t.color.muted} dimColor wrap="truncate-end">{sep}</Text>
-          ) : null}
-        </Fragment>
+      {allEntries.map((entry, i) => (
+        <Text
+          bold={entry.kind === 'header'}
+          color={entry.kind === 'header' ? t.color.accent : entry.kind === 'separator' ? t.color.muted : undefined}
+          dimColor={entry.kind === 'separator'}
+          key={i}
+          wrap="truncate-end"
+        >
+          {entry.text}
+        </Text>
       ))}
     </Box>
   )
